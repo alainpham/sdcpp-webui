@@ -339,6 +339,13 @@ function applyForm(nextForm: Partial<GenerationForm>, reset = false): void {
     deepAssign(form, nextForm);
 }
 
+function normalizeCustomSigmas(value: unknown): string {
+    if (Array.isArray(value)) {
+        return value.join(", ");
+    }
+    return typeof value === "string" ? value.trim() : "";
+}
+
 function currentWebUiSettings(): WebUiSettings {
     const savedForm = {
         ...form,
@@ -358,6 +365,14 @@ function currentWebUiSettings(): WebUiSettings {
 function applyWebUiSettings(settings: WebUiSettings): void {
     applyForm({
         ...settings.form,
+        sample_params: {
+            ...settings.form.sample_params,
+            custom_sigmas: normalizeCustomSigmas(settings.form.sample_params?.custom_sigmas),
+        },
+        high_noise_sample_params: {
+            ...settings.form.high_noise_sample_params,
+            custom_sigmas: normalizeCustomSigmas(settings.form.high_noise_sample_params?.custom_sigmas),
+        },
         init_image: null,
         end_image: null,
         ref_images: [],
