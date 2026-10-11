@@ -16,6 +16,7 @@ function assignSampleParams(
     target.scheduler = sample.scheduler || "default";
     target.sample_method = sample.sample_method || "default";
     target.sample_steps = finiteOrFallback(sample.sample_steps, fallbackSteps);
+    target.custom_sigmas = Array.isArray(sample.custom_sigmas) ? sample.custom_sigmas.join(", ") : "";
     target.eta = sample.eta == null ? "" : sample.eta;
     target.shifted_timestep = finiteOrFallback(sample.shifted_timestep, 0);
     target.flow_shift = sample.flow_shift == null ? "" : sample.flow_shift;

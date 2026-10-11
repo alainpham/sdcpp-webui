@@ -12,6 +12,24 @@ function nullable(value: unknown): unknown {
     return value === "" || value == null ? null : value;
 }
 
+function parseCustomSigmas(value: unknown): number[] {
+    const text = String(value ?? "").trim();
+    if (!text) {
+        return [];
+    }
+
+    const entries = text.split(",");
+    if (entries.some((entry) => !entry.trim())) {
+        throw new Error("Custom sigmas must be comma-separated numbers with no empty entries.");
+    }
+
+    const sigmas = entries.map((entry) => Number(entry.trim()));
+    if (sigmas.length < 2 || sigmas.some((sigma) => !Number.isFinite(sigma))) {
+        throw new Error("Custom sigmas must contain at least two finite numbers.");
+    }
+    return sigmas;
+}
+
 interface SampleParamsRequest {
     sample_steps: number;
     shifted_timestep: number;
@@ -41,7 +59,7 @@ function buildSampleParams(sample: SampleParams, defaultSteps: number): SamplePa
     const sampleParams: SampleParamsRequest = {
         sample_steps: parseNumber(sample.sample_steps, defaultSteps),
         shifted_timestep: parseNumber(sample.shifted_timestep, 0),
-        custom_sigmas: [],
+        custom_sigmas: parseCustomSigmas(sample.custom_sigmas),
         guidance: {
             txt_cfg: parseNumber(sample.guidance.txt_cfg, 7),
             distilled_guidance: parseNumber(sample.guidance.distilled_guidance, 3.5),
