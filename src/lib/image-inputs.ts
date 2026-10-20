@@ -16,7 +16,13 @@ export const IMAGE_INPUTS: readonly ImageInputConfig[] = [
     {
         target: "control_image",
         label: "Control Image",
-        description: "ControlNet-style guidance image.",
+        description: "Preprocessed control image, such as an edge or depth map.",
+        layout: "full",
+    },
+    {
+        target: "ip_adapter_image",
+        label: "IP-Adapter Image",
+        description: "Reference appearance for the selected IP-Adapter model.",
         layout: "full",
     },
 ];

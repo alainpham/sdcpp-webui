@@ -23,6 +23,7 @@ export function createBlankForm(): GenerationForm {
         clip_skip: -1,
         strength: 0.75,
         control_strength: 0.9,
+        ip_adapter_strength: 1.0,
         moe_boundary: 0.875,
         vace_strength: 1.0,
         output_format: "png",
@@ -69,6 +70,7 @@ export function createBlankForm(): GenerationForm {
         control_frames: [],
         mask_image: null,
         control_image: null,
+        ip_adapter_image: null,
         lora: [],
         vae_tiling_params: {
             enabled: false,

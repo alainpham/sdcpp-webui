@@ -19,7 +19,7 @@ export async function filesToImageEntries(fileList: FileList | File[]): Promise<
 }
 
 export function assignImageEntries(form: GenerationForm, target: ImageTarget, images: ImageEntry[]): void {
-    if (target === "init_image" || target === "mask_image" || target === "control_image" || target === "end_image") {
+    if (target === "init_image" || target === "mask_image" || target === "control_image" || target === "ip_adapter_image" || target === "end_image") {
         form[target] = images[0] || null;
         return;
     }
@@ -29,7 +29,7 @@ export function assignImageEntries(form: GenerationForm, target: ImageTarget, im
 }
 
 export function clearImageEntries(form: GenerationForm, target: ImageTarget): void {
-    if (target === "init_image" || target === "mask_image" || target === "control_image" || target === "end_image") {
+    if (target === "init_image" || target === "mask_image" || target === "control_image" || target === "ip_adapter_image" || target === "end_image") {
         form[target] = null;
         return;
     }

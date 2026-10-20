@@ -1,4 +1,5 @@
-import type { GenerationForm, GenerationMode, SampleParams } from "./types";
+import { availableCacheModes, featuresForMode, supportsEta, supportsFlowShift, usesSCM } from "./generation-features";
+import type { GenerationFeatures, GenerationForm, GenerationMode, SampleParams } from "./types";
 
 function parseNumber(value: unknown, fallback: number): number {
     if (value === "" || value == null) {
@@ -15,7 +16,6 @@ function nullable(value: unknown): unknown {
 interface SampleParamsRequest {
     sample_steps: number;
     shifted_timestep: number;
-    custom_sigmas: number[];
     guidance: {
         txt_cfg: number;
         distilled_guidance: number;
@@ -41,7 +41,6 @@ function buildSampleParams(sample: SampleParams, defaultSteps: number): SamplePa
     const sampleParams: SampleParamsRequest = {
         sample_steps: parseNumber(sample.sample_steps, defaultSteps),
         shifted_timestep: parseNumber(sample.shifted_timestep, 0),
-        custom_sigmas: [],
         guidance: {
             txt_cfg: parseNumber(sample.guidance.txt_cfg, 7),
             distilled_guidance: parseNumber(sample.guidance.distilled_guidance, 3.5),
@@ -143,6 +142,8 @@ export function buildImageRequestBody(form: GenerationForm) {
         auto_resize_ref_image: true,
         increase_ref_index: false,
         control_strength: parseNumber(form.control_strength, 0.9),
+        ip_adapter_strength: parseNumber(form.ip_adapter_strength, 1.0),
+        ip_adapter_image: form.ip_adapter_image ? form.ip_adapter_image.dataUrl : null,
         init_image: form.init_image ? form.init_image.dataUrl : null,
         ref_images: form.ref_images.map((item) => item.dataUrl),
         mask_image: form.mask_image ? form.mask_image.dataUrl : null,
@@ -169,6 +170,57 @@ export function buildVideoRequestBody(form: GenerationForm) {
     };
 }
 
-export function buildRequestBodyForMode(mode: GenerationMode, form: GenerationForm) {
-    return mode === "video" ? buildVideoRequestBody(form) : buildImageRequestBody(form);
+export function buildRequestBodyForMode(mode: GenerationMode, form: GenerationForm, declared?: GenerationFeatures) {
+    if (!declared) return mode === "video" ? buildVideoRequestBody(form) : buildImageRequestBody(form);
+    const features = featuresForMode(declared, mode);
+    const visibleForm = {
+        ...form,
+        init_image: features.init_image ? form.init_image : null,
+        end_image: features.end_image ? form.end_image : null,
+        mask_image: features.mask_image ? form.mask_image : null,
+        control_image: features.control_image ? form.control_image : null,
+        ip_adapter_image: features.ip_adapter ? form.ip_adapter_image : null,
+        ref_images: features.ref_images ? form.ref_images : [],
+        control_frames: features.control_frames ? form.control_frames : [],
+    };
+    const request: Record<string, any> = mode === "video" ? buildVideoRequestBody(visibleForm) : buildImageRequestBody(visibleForm);
+    const fields: Record<string, string[]> = {
+        clip_skip: ["clip_skip"], img2img: ["strength"], init_image: ["init_image"],
+        mask_image: ["mask_image"], controlnet: ["control_strength"],
+        control_image: ["control_image"], ip_adapter: ["ip_adapter_image", "ip_adapter_strength"],
+        ref_images: ["ref_images", "auto_resize_ref_image", "increase_ref_index"],
+        end_image: ["end_image"], control_frames: ["control_frames"], vace: ["vace_strength"],
+        high_noise: ["high_noise_sample_params", "moe_boundary"], lora: ["lora"],
+        vae_tiling: ["vae_tiling_params"], cache: ["cache_mode", "cache_option", "scm_mask", "scm_policy_dynamic"],
+        preview: ["preview", "preview_interval"],
+    };
+    for (const [feature, keys] of Object.entries(fields)) {
+        if (!features[feature]) for (const key of keys) delete request[key];
+    }
+    if (!visibleForm.init_image) delete request.strength;
+    for (const key of ["sample_params", "high_noise_sample_params"] as const) {
+        const sample = request[key];
+        if (!sample) continue;
+        if (!features.distilled_guidance) delete sample.guidance.distilled_guidance;
+        if (!features.img_cfg) delete sample.guidance.img_cfg;
+        if (!features.slg) delete sample.guidance.slg;
+        if (!features.shifted_timestep) delete sample.shifted_timestep;
+        if (!supportsEta(sample.sample_method, features)) delete sample.eta;
+        if (!supportsFlowShift(sample.scheduler, features)) delete sample.flow_shift;
+    }
+    if (request.lora && !features.high_noise) {
+        request.lora = request.lora.filter((item: { is_high_noise: boolean }) => !item.is_high_noise)
+            .map(({ is_high_noise, ...item }: { is_high_noise: boolean }) => item);
+    }
+    if (features.cache) {
+        if (!availableCacheModes(features).includes(request.cache_mode)) request.cache_mode = "disabled";
+        if (request.cache_mode === "disabled") delete request.cache_option;
+        if (!usesSCM(request.cache_mode)) {
+            delete request.scm_mask;
+            delete request.scm_policy_dynamic;
+        }
+    }
+    if (request.preview === "tae" && !features.preview_tae) request.preview = "none";
+    if (request.preview === "none") delete request.preview_interval;
+    return request;
 }

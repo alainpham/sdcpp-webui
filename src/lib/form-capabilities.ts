@@ -1,5 +1,5 @@
 import { createBlankForm } from "./form-defaults";
-import type { Capabilities, GenerationForm, SampleParams } from "./types";
+import type { Capabilities, GenerationForm, RecipeDefaults, SampleParams } from "./types";
 
 function finiteOrFallback(value: unknown, fallback: number): number {
     return typeof value === "number" && Number.isFinite(value) ? value : fallback;
@@ -49,6 +49,7 @@ export function formFromCapabilities(capabilities: Capabilities): GenerationForm
     form.clip_skip = typeof defaults.clip_skip === "number" ? defaults.clip_skip : -1;
     form.strength = finiteOrFallback(defaults.strength, 0.75);
     form.control_strength = finiteOrFallback(defaults.control_strength, 0.9);
+    form.ip_adapter_strength = finiteOrFallback(defaults.ip_adapter_strength, 1.0);
     form.moe_boundary = finiteOrFallback(defaults.moe_boundary, 0.875);
     form.vace_strength = finiteOrFallback(defaults.vace_strength, 1.0);
     form.output_format = defaults.output_format || "png";
@@ -75,4 +76,25 @@ export function formFromCapabilities(capabilities: Capabilities): GenerationForm
             : true;
 
     return form;
+}
+
+export function applyRecipeDefaults(form: GenerationForm, defaults: RecipeDefaults = {}): void {
+    for (const key of ["width", "height", "video_frames", "fps", "strength", "moe_boundary"] as const) {
+        if (defaults[key] !== undefined) form[key] = defaults[key];
+    }
+    const sample = form.sample_params;
+    const highNoise = form.high_noise_sample_params;
+    if (defaults.steps !== undefined) sample.sample_steps = defaults.steps;
+    if (defaults.cfg_scale !== undefined) sample.guidance.txt_cfg = defaults.cfg_scale;
+    if (defaults.img_cfg_scale !== undefined) sample.guidance.img_cfg = defaults.img_cfg_scale;
+    if (defaults.distilled_guidance !== undefined) sample.guidance.distilled_guidance = defaults.distilled_guidance;
+    if (defaults.sampling_method !== undefined) sample.sample_method = defaults.sampling_method;
+    if (defaults.scheduler !== undefined) sample.scheduler = defaults.scheduler === "normal" ? "discrete" : defaults.scheduler;
+    if (defaults.flow_shift !== undefined) sample.flow_shift = defaults.flow_shift;
+    if (defaults.shifted_timestep !== undefined) sample.shifted_timestep = defaults.shifted_timestep;
+    if (defaults.high_noise_steps !== undefined) highNoise.sample_steps = defaults.high_noise_steps;
+    if (defaults.high_noise_cfg_scale !== undefined) highNoise.guidance.txt_cfg = defaults.high_noise_cfg_scale;
+    if (defaults.high_noise_flow_shift !== undefined) highNoise.flow_shift = defaults.high_noise_flow_shift;
+    if (defaults.high_noise_sampling_method !== undefined) highNoise.sample_method = defaults.high_noise_sampling_method;
+    if (defaults.high_noise_scheduler !== undefined) highNoise.scheduler = defaults.high_noise_scheduler === "normal" ? "discrete" : defaults.high_noise_scheduler;
 }

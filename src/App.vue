@@ -2,16 +2,22 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 
 import CollapsibleSection from "./components/CollapsibleSection.vue";
+import ModelSelector from "./components/ModelSelector.vue";
+import SearchableSelect from "./components/SearchableSelect.vue";
 import ImageDropzone from "./components/ImageDropzone.vue";
 import StatusChip from "./components/StatusChip.vue";
 import { cancelJob, getCapabilities, getJob, submitImageJob, submitVideoJob } from "./lib/api";
-import { buildRequestBodyForMode, CACHE_MODES, createBlankForm, formFromCapabilities } from "./lib/form";
+import { applyRecipeDefaults, buildRequestBodyForMode, createBlankForm, formFromCapabilities } from "./lib/form";
+import { availableCacheModes, featuresForMode, supportsEta, supportsFlowShift, usesSCM } from "./lib/generation-features";
 import { IMAGE_INPUTS, VIDEO_IMAGE_INPUTS } from "./lib/image-inputs";
 import { assignImageEntries, clearImageEntries, filesToImageEntries, removeImageEntry } from "./lib/images";
 import { createStoredRef, normalizePollIntervalMs } from "./lib/settings";
 import type {
     Capabilities,
+    ModelStatus,
+    Recipe,
     GenerationForm,
+    GenerationFeatures,
     GenerationMode,
     ImageEntry,
     ImageTarget,
@@ -46,6 +52,11 @@ const loadingCapabilities = ref(false);
 const capabilitiesError = ref("");
 const serviceOnline = ref(false);
 const capabilities = ref<Capabilities | null>(null);
+const modelStatus = ref<ModelStatus | null>(null);
+const selectedRecipe = ref<Recipe | null>(null);
+const applyRecipeDefaultsOnSelect = createStoredRef<boolean>("sdcpp-webui-apply-recipe-defaults", true, (value: unknown) => typeof value === "boolean" ? value : true);
+const modelSelection = ref<Record<string, string>>({});
+const modelReady = computed(() => modelStatus.value ? modelStatus.value.state === "ready" : Boolean(capabilities.value?.model?.name));
 const currentJob = ref<Job | null>(null);
 const selectedOutputIndex = ref(0);
 const statusMessage = ref("");
@@ -54,21 +65,31 @@ const form = reactive<GenerationForm>(createBlankForm());
 
 let pollTimer = 0;
 let elapsedTimer = 0;
-const nowSeconds = ref(Date.now() / 1000);
+const nowMilliseconds = ref(Date.now());
 
 const modelName = computed(() => {
     const model = capabilities.value?.model;
-    return model?.stem || model?.name || "No model info";
+    return model?.stem || model?.name || "No model loaded";
 });
 
 const supportedModes = computed(() => capabilities.value?.supported_modes || []);
+const loadedRecipeId = computed(() => modelStatus.value?.runtime_recipe?.id || modelStatus.value?.recipe);
+const recipeMode = computed<GenerationMode>(() => selectedRecipe.value?.source === "command_line"
+    ? capabilities.value?.current_mode === "vid_gen" ? "video" : "image"
+    : selectedRecipe.value?.defaults?.video_frames !== undefined ? "video" : "image");
+const previewingRecipe = computed(() => Boolean(selectedRecipe.value) &&
+    (!modelReady.value || loadedRecipeId.value !== selectedRecipe.value?.id));
 const supportsImageMode = computed(() => {
-    return !supportedModes.value.length || supportedModes.value.includes("img_gen");
+    if (previewingRecipe.value) return recipeMode.value === "image";
+    return modelReady.value && (!supportedModes.value.length || supportedModes.value.includes("img_gen"));
 });
 const supportsVideoMode = computed(() => {
-    return !supportedModes.value.length || supportedModes.value.includes("vid_gen");
+    if (previewingRecipe.value) return recipeMode.value === "video";
+    return modelReady.value && (!supportedModes.value.length || supportedModes.value.includes("vid_gen"));
 });
 const selectedModeKey = computed<"img_gen" | "vid_gen">(() => generationMode.value === "video" ? "vid_gen" : "img_gen");
+const canGenerate = computed(() => modelReady.value && !previewingRecipe.value &&
+    (!supportedModes.value.length || supportedModes.value.includes(selectedModeKey.value)));
 const currentJobModeKey = computed<"img_gen" | "vid_gen">(() => currentJob.value?.kind || selectedModeKey.value);
 const selectedModeFeatures = computed(() => {
     return capabilities.value?.features_by_mode?.[selectedModeKey.value] || {};
@@ -86,14 +107,33 @@ const outputFormats = computed(() => generationMode.value === "video" ? videoOut
 const samplers = computed(() => capabilities.value?.samplers || ["default"]);
 const schedulers = computed(() => capabilities.value?.schedulers || ["default"]);
 const availableLoras = computed(() => capabilities.value?.loras || []);
-const currentImageInputs = computed(() => generationMode.value === "video" ? VIDEO_IMAGE_INPUTS : IMAGE_INPUTS);
+const generationFeatures = computed<GenerationFeatures>(() => {
+    const loadedSelection = !previewingRecipe.value && loadedRecipeId.value === selectedRecipe.value?.id;
+    const declared = loadedSelection ? capabilities.value?.generation_features : selectedRecipe.value?.effective_features;
+    const features = { ...(declared || capabilities.value?.generation_features || {}) };
+    if (selectedRecipe.value && selectedRecipe.value.source !== "command_line") {
+        for (const [feature, slots] of Object.entries({ high_noise: ["high_noise_diffusion_model"], preview_tae: ["tae", "taesd"] })) {
+            features[feature] = Boolean(features[feature] && slots.some((slot) => modelSelection.value[slot]));
+        }
+        if (modelSelection.value.pulid_weights) features.slg = false;
+    }
+    return featuresForMode(features, generationMode.value);
+});
+const hasFeature = (name: string): boolean => Boolean(generationFeatures.value[name]);
+const sampleHasEta = (sample: SampleParams): boolean => supportsEta(sample.sample_method, generationFeatures.value);
+const sampleHasFlowShift = (sample: SampleParams): boolean => supportsFlowShift(sample.scheduler, generationFeatures.value);
+const sampleHasExtras = (sample: SampleParams): boolean => sampleHasEta(sample) || hasFeature("shifted_timestep");
+const hasGuidanceExtras = computed(() => hasFeature("img_cfg") || hasFeature("slg"));
+const hasConditioning = computed(() => ["clip_skip", "controlnet", "vace"].some(hasFeature));
+const cacheModes = computed(() => availableCacheModes(generationFeatures.value));
+const currentImageInputs = computed(() => (generationMode.value === "video" ? VIDEO_IMAGE_INPUTS : IMAGE_INPUTS).filter((input) => hasFeature(input.target)));
 const gridImageInputs = computed(() => currentImageInputs.value.filter((input) => input.layout === "grid"));
 const fullImageInputs = computed(() => currentImageInputs.value.filter((input) => input.layout === "full"));
 const queueLimit = computed(() => capabilities.value?.limits?.max_queue_size ?? "unknown");
 const canCancelQueued = computed(() => Boolean(currentJobFeatures.value.cancel_queued));
 const canCancelGenerating = computed(() => Boolean(currentJobFeatures.value.cancel_generating));
-const supportsPreview = computed(() => Boolean(currentJobFeatures.value.preview));
-const previewModes = computed(() => capabilities.value?.preview_modes || ["none", "proj", "tae", "vae"]);
+const supportsPreview = computed(() => hasFeature("preview"));
+const previewModes = computed(() => (capabilities.value?.preview_modes || ["none", "proj", "tae", "vae"]).filter((mode) => mode !== "tae" || hasFeature("preview_tae")));
 
 const currentStatus = computed(() => currentJob.value?.status || "idle");
 const currentJobKind = computed(() => currentJob.value?.kind || null);
@@ -173,13 +213,13 @@ function buildSampleSummary(sample: SampleParams): string {
     const flowShift = sample.flow_shift === "" || sample.flow_shift == null
         ? "flow auto"
         : `flow ${sample.flow_shift}`;
-    return `${scheduler} · ${flowShift} · ${method} · ${steps} steps`;
+    return [scheduler, ...(sampleHasFlowShift(sample) ? [flowShift] : []), method, `${steps} steps`].join(" · ");
 }
 
 function buildGuidanceSummary(sample: SampleParams): string {
     const cfg = sample.guidance.txt_cfg;
     const distilled = sample.guidance.distilled_guidance;
-    return `cfg ${cfg} · distilled ${distilled}`;
+    return `cfg ${cfg}` + (hasFeature("distilled_guidance") ? ` · distilled ${distilled}` : "");
 }
 
 const sampleSummary = computed(() => buildSampleSummary(form.sample_params));
@@ -195,15 +235,16 @@ const loraSummary = computed(() => {
 });
 const imageInputsSummary = computed(() => {
     const parts: string[] = [];
-    if (form.init_image) parts.push(generationMode.value === "video" ? "start" : "init");
+    if (hasFeature("init_image") && form.init_image) parts.push(generationMode.value === "video" ? "start" : "init");
     if (generationMode.value === "image") {
-        if (form.mask_image) parts.push("mask");
-        if (form.control_image) parts.push("control");
-        if (form.ref_images.length) parts.push(`${form.ref_images.length} refs`);
+        if (hasFeature("mask_image") && form.mask_image) parts.push("mask");
+        if (hasFeature("control_image") && form.control_image) parts.push("control");
+        if (hasFeature("ip_adapter") && form.ip_adapter_image) parts.push("IP-Adapter");
+        if (hasFeature("ref_images") && form.ref_images.length) parts.push(`${form.ref_images.length} refs`);
     } else {
-        if (form.end_image) parts.push("end");
-        if (form.ref_images.length) parts.push(`${form.ref_images.length} refs`);
-        if (form.control_frames.length) parts.push(`${form.control_frames.length} frames`);
+        if (hasFeature("end_image") && form.end_image) parts.push("end");
+        if (hasFeature("ref_images") && form.ref_images.length) parts.push(`${form.ref_images.length} refs`);
+        if (hasFeature("control_frames") && form.control_frames.length) parts.push(`${form.control_frames.length} frames`);
     }
     return parts.length ? parts.join(" · ") : "No images";
 });
@@ -222,13 +263,11 @@ const cacheSummary = computed(() => {
     return option ? `${mode} · ${option}` : mode;
 });
 const conditioningSummary = computed(() => {
-    const clipSkip = formatSummaryNumber(form.clip_skip, 0);
-    const strength = formatSummaryNumber(form.strength);
-    if (generationMode.value === "video") {
-        return `clip_skip ${clipSkip} · strength ${strength} · vace ${formatSummaryNumber(form.vace_strength)}`;
-    }
-    const controlStrength = formatSummaryNumber(form.control_strength);
-    return `clip_skip ${clipSkip} · img ${strength} · control ${controlStrength}`;
+    const parts: string[] = [];
+    if (hasFeature("clip_skip")) parts.push(`clip_skip ${formatSummaryNumber(form.clip_skip, 0)}`);
+    if (hasFeature("controlnet")) parts.push(`control ${formatSummaryNumber(form.control_strength)}`);
+    if (hasFeature("vace")) parts.push(`vace ${formatSummaryNumber(form.vace_strength)}`);
+    return parts.join(" · ");
 });
 
 function defaultOutputFormatForMode(mode: GenerationMode): string {
@@ -277,14 +316,48 @@ function applyForm(nextForm: GenerationForm): void {
     deepAssign(form, createBlankForm(), nextForm);
 }
 
+function updateCatalogRecipe(recipe: Recipe | null): void {
+    if (selectedRecipe.value) selectedRecipe.value = recipe;
+    else if (recipe && (recipe.source === "command_line" || (!modelReady.value && modelStatus.value?.state !== "loading"))) selectRecipe(recipe);
+}
+
+function selectRecipe(recipe: Recipe): void {
+    selectedRecipe.value = recipe;
+    if (applyRecipeDefaultsOnSelect.value) {
+        if (recipe.source === "command_line" && capabilities.value?.runtime?.origin === "command_line") {
+            const defaults = formFromCapabilities(capabilities.value);
+            for (const key of ["width", "height", "video_frames", "fps", "strength"] as const) form[key] = defaults[key];
+            deepAssign(form.sample_params, defaults.sample_params);
+            deepAssign(form.high_noise_sample_params, defaults.high_noise_sample_params);
+        } else {
+            applyRecipeDefaults(form, recipe.defaults);
+        }
+    }
+    selectedGenerationTab.value = recipeMode.value;
+    activeTab.value = recipeMode.value;
+    ensureOutputFormatForMode(recipeMode.value);
+}
+
 async function refreshCapabilities(): Promise<void> {
     loadingCapabilities.value = true;
     capabilitiesError.value = "";
     try {
         const response = await getCapabilities(baseUrl.value);
+        const initializeForm = !capabilities.value;
+        const enteringCommandLine = response.runtime?.origin === "command_line" && capabilities.value?.runtime?.origin !== "command_line";
         capabilities.value = response;
+        if (response.runtime) modelStatus.value = response.runtime;
         serviceOnline.value = true;
-        applyForm(formFromCapabilities(response));
+        if (initializeForm) {
+            const defaults = formFromCapabilities(response);
+            defaults.prompt = form.prompt || defaults.prompt;
+            defaults.negative_prompt = form.negative_prompt || defaults.negative_prompt;
+            applyForm(defaults);
+            if (selectedRecipe.value && applyRecipeDefaultsOnSelect.value) applyRecipeDefaults(form, selectedRecipe.value.defaults);
+        }
+        if (response.runtime?.runtime_recipe && (enteringCommandLine || !selectedRecipe.value)) {
+            selectRecipe(response.runtime.runtime_recipe);
+        }
         if (selectedGenerationTab.value === "image" && !supportsImageMode.value && supportsVideoMode.value) {
             selectedGenerationTab.value = "video";
         } else if (selectedGenerationTab.value === "video" && !supportsVideoMode.value && supportsImageMode.value) {
@@ -340,9 +413,9 @@ function stopElapsedTimer(): void {
 
 function startElapsedTimer(): void {
     stopElapsedTimer();
-    nowSeconds.value = Date.now() / 1000;
+    nowMilliseconds.value = Date.now();
     elapsedTimer = window.setInterval(() => {
-        nowSeconds.value = Date.now() / 1000;
+        nowMilliseconds.value = Date.now();
     }, 100);
 }
 
@@ -376,8 +449,9 @@ async function pollJob(id: string): Promise<void> {
 }
 
 async function generate(): Promise<void> {
+    if (!canGenerate.value || isJobRunning.value) return;
     try {
-        const request = buildRequestBodyForMode(generationMode.value, form);
+        const request = buildRequestBodyForMode(generationMode.value, form, generationFeatures.value);
         clearMessage();
         selectedOutputIndex.value = 0;
         startElapsedTimer();
@@ -446,25 +520,20 @@ function selectOutput(index: number): void {
     selectedOutputIndex.value = index;
 }
 
-function formatUnixTime(seconds: number | undefined): string {
-    if (!seconds) {
+function formatUnixTime(milliseconds: number | undefined): string {
+    if (!milliseconds) {
         return "No job";
     }
-    return new Date(seconds * 1000).toLocaleString();
+    return new Date(milliseconds).toLocaleString();
 }
 
-function formatElapsed(started: number | undefined, completed: number | undefined): string {
-    if (!started) {
-        return "Idle";
-    }
-    const end = completed || nowSeconds.value;
-    const total = Math.max(0, end - started);
-    if (total < 60) {
-        return `${total.toFixed(1)}s`;
-    }
+function formatElapsed(job: Job | null): string {
+    if (!job?.started) return "Idle";
+    const elapsed = ((job.completed || nowMilliseconds.value) - job.started) / 1000;
+    const total = Math.round(Math.max(0, elapsed) * 100) / 100;
+    if (total < 60) return `${total.toFixed(2)}s`;
     const minutes = Math.floor(total / 60);
-    const seconds = total - minutes * 60;
-    return `${minutes}m ${seconds.toFixed(1)}s`;
+    return `${minutes}m ${(total - minutes * 60).toFixed(2)}s`;
 }
 
 function formatSummaryNumber(value: number, digits = 3): string {
@@ -510,6 +579,14 @@ async function onPaste(event: ClipboardEvent): Promise<void> {
     setMessage("Pasted image into init_image.", "success");
 }
 
+watch(baseUrl, () => { selectedRecipe.value = null; });
+
+watch(cacheModes, (modes) => { if (!modes.includes(form.cache.mode)) form.cache.mode = "disabled"; });
+watch(previewModes, (modes) => { if (!modes.includes(form.preview_mode)) form.preview_mode = "none"; });
+watch(generationFeatures, (features) => {
+    if (!features.high_noise) form.lora = form.lora.filter((item) => !item.is_high_noise);
+});
+
 watch(generationMode, (mode) => {
     ensureOutputFormatForMode(mode);
 });
@@ -545,9 +622,6 @@ onBeforeUnmount(() => {
                         <span>{{ modelName }}</span>
                     </div>
                     <h1 class="page-title">{{ modelName }}</h1>
-                    <p class="page-description">
-                        Native async image and video generation interface for the local `stable-diffusion.cpp` server.
-                    </p>
                 </div>
                 <div class="page-header__meta">
                     <StatusChip :status="serviceOnline ? 'online' : 'offline'" :label="serviceOnline ? 'service online' : 'service unavailable'" />
@@ -598,6 +672,8 @@ onBeforeUnmount(() => {
             </div>
         </header>
 
+        <ModelSelector v-model:apply-defaults="applyRecipeDefaultsOnSelect" :base-url="baseUrl" :busy="isJobRunning" @status="modelStatus = $event" @changed="refreshCapabilities" @recipe="selectRecipe" @selection="modelSelection = $event" @catalog-recipe="updateCatalogRecipe" />
+
         <div v-if="activeTab !== 'settings'" class="layout">
             <section class="panel control-panel">
                 <div class="panel-header">
@@ -644,7 +720,7 @@ onBeforeUnmount(() => {
                                 <option v-for="scheduler in schedulers" :key="scheduler" :value="scheduler">{{ scheduler }}</option>
                             </select>
                         </div>
-                        <div class="field"><label>Flow Shift</label><input v-model="form.sample_params.flow_shift" type="number" step="0.01" placeholder="blank = default" /></div>
+                        <div v-if="sampleHasFlowShift(form.sample_params)" class="field"><label>Flow Shift</label><input v-model="form.sample_params.flow_shift" type="number" step="0.01" placeholder="blank = default" /></div>
                         <div class="field">
                             <label>Method</label>
                             <select v-model="form.sample_params.sample_method">
@@ -654,37 +730,37 @@ onBeforeUnmount(() => {
                         </div>
                         <div class="field"><label>Steps</label><input v-model.number="form.sample_params.sample_steps" type="number" /></div>
                     </div>
-                    <div class="sample-panel__extras">
+                    <div v-if="sampleHasExtras(form.sample_params)" class="sample-panel__extras">
                         <button class="module-card__link" type="button" @click="toggleSection('sampleAdvanced')">
                             {{ sectionState.sampleAdvanced ? "Hide extras" : "Show extras" }}
                         </button>
                     </div>
-                    <div v-if="sectionState.sampleAdvanced" class="fields">
-                        <div class="field"><label>Eta</label><input v-model="form.sample_params.eta" type="number" step="0.01" placeholder="blank = default" /></div>
-                        <div class="field"><label>Shifted Timestep</label><input v-model.number="form.sample_params.shifted_timestep" type="number" /></div>
+                    <div v-if="sectionState.sampleAdvanced && sampleHasExtras(form.sample_params)" class="fields">
+                        <div v-if="sampleHasEta(form.sample_params)" class="field"><label>Eta</label><input v-model="form.sample_params.eta" type="number" step="0.01" placeholder="blank = default" /></div>
+                        <div v-if="hasFeature('shifted_timestep')" class="field"><label>Shifted Timestep</label><input v-model.number="form.sample_params.shifted_timestep" type="number" /></div>
                     </div>
                 </CollapsibleSection>
 
                 <CollapsibleSection class="stack-top" eyebrow="Guidance" :summary="guidanceSummary" :open="sectionState.guidance" variant="module" @toggle="toggleSection('guidance')">
                     <div class="fields">
                         <div class="field"><label>CFG Scale</label><input v-model.number="form.sample_params.guidance.txt_cfg" type="number" step="0.1" /></div>
-                        <div class="field"><label>Distilled Guidance</label><input v-model.number="form.sample_params.guidance.distilled_guidance" type="number" step="0.1" /></div>
+                        <div v-if="hasFeature('distilled_guidance')" class="field"><label>Distilled Guidance</label><input v-model.number="form.sample_params.guidance.distilled_guidance" type="number" step="0.1" /></div>
                     </div>
-                    <div class="sample-panel__extras">
+                    <div v-if="hasGuidanceExtras" class="sample-panel__extras">
                         <button class="module-card__link" type="button" @click="toggleSection('guidanceAdvanced')">
                             {{ sectionState.guidanceAdvanced ? "Hide extras" : "Show extras" }}
                         </button>
                     </div>
-                    <div v-if="sectionState.guidanceAdvanced" class="fields">
-                        <div class="field"><label>Image CFG</label><input v-model="form.sample_params.guidance.img_cfg" type="number" step="0.1" placeholder="blank = follow text cfg" /></div>
-                        <div class="field"><label>SLG Layers</label><input v-model="form.sample_params.guidance.slg_layers" placeholder="7,8,9" /></div>
-                        <div class="field"><label>SLG Layer Start</label><input v-model.number="form.sample_params.guidance.layer_start" type="number" step="0.01" /></div>
-                        <div class="field"><label>SLG Layer End</label><input v-model.number="form.sample_params.guidance.layer_end" type="number" step="0.01" /></div>
-                        <div class="field"><label>SLG Scale</label><input v-model.number="form.sample_params.guidance.scale" type="number" step="0.01" /></div>
+                    <div v-if="sectionState.guidanceAdvanced && hasGuidanceExtras" class="fields">
+                        <div v-if="hasFeature('img_cfg')" class="field"><label>Image CFG</label><input v-model="form.sample_params.guidance.img_cfg" type="number" step="0.1" placeholder="blank = follow text cfg" /></div>
+                        <div v-if="hasFeature('slg')" class="field"><label>SLG Layers</label><input v-model="form.sample_params.guidance.slg_layers" placeholder="7,8,9" /></div>
+                        <div v-if="hasFeature('slg')" class="field"><label>SLG Layer Start</label><input v-model.number="form.sample_params.guidance.layer_start" type="number" step="0.01" /></div>
+                        <div v-if="hasFeature('slg')" class="field"><label>SLG Layer End</label><input v-model.number="form.sample_params.guidance.layer_end" type="number" step="0.01" /></div>
+                        <div v-if="hasFeature('slg')" class="field"><label>SLG Scale</label><input v-model.number="form.sample_params.guidance.scale" type="number" step="0.01" /></div>
                     </div>
                 </CollapsibleSection>
 
-                <CollapsibleSection v-if="generationMode === 'video'" class="stack-top" eyebrow="High Noise Pass" :summary="highNoiseSummary" :open="sectionState.highNoise" variant="module" @toggle="toggleSection('highNoise')">
+                <CollapsibleSection v-if="hasFeature('high_noise')" class="stack-top" eyebrow="High Noise Pass" :summary="highNoiseSummary" :open="sectionState.highNoise" variant="module" @toggle="toggleSection('highNoise')">
                     <div class="field">
                         <label>MoE Boundary</label>
                         <input v-model.number="form.moe_boundary" type="number" step="0.001" />
@@ -698,7 +774,7 @@ onBeforeUnmount(() => {
                                     <option v-for="scheduler in schedulers" :key="`high-noise-${scheduler}`" :value="scheduler">{{ scheduler }}</option>
                                 </select>
                             </div>
-                            <div class="field"><label>Flow Shift</label><input v-model="form.high_noise_sample_params.flow_shift" type="number" step="0.01" placeholder="blank = default" /></div>
+                            <div v-if="sampleHasFlowShift(form.high_noise_sample_params)" class="field"><label>Flow Shift</label><input v-model="form.high_noise_sample_params.flow_shift" type="number" step="0.01" placeholder="blank = default" /></div>
                             <div class="field">
                                 <label>Method</label>
                                 <select v-model="form.high_noise_sample_params.sample_method">
@@ -707,50 +783,47 @@ onBeforeUnmount(() => {
                                 </select>
                             </div>
                             <div class="field"><label>Steps</label><input v-model.number="form.high_noise_sample_params.sample_steps" type="number" /></div>
-                            <div class="field"><label>Eta</label><input v-model="form.high_noise_sample_params.eta" type="number" step="0.01" placeholder="blank = auto" /></div>
-                            <div class="field"><label>Shifted Timestep</label><input v-model.number="form.high_noise_sample_params.shifted_timestep" type="number" /></div>
+                            <div v-if="sampleHasEta(form.high_noise_sample_params)" class="field"><label>Eta</label><input v-model="form.high_noise_sample_params.eta" type="number" step="0.01" placeholder="blank = auto" /></div>
+                            <div v-if="hasFeature('shifted_timestep')" class="field"><label>Shifted Timestep</label><input v-model.number="form.high_noise_sample_params.shifted_timestep" type="number" /></div>
                         </div>
                     </CollapsibleSection>
                     <CollapsibleSection class="stack-top" eyebrow="Guidance" :summary="buildGuidanceSummary(form.high_noise_sample_params)" :open="sectionState.highNoiseGuidance" variant="plain" @toggle="toggleSection('highNoiseGuidance')">
                         <div class="fields">
                             <div class="field"><label>CFG Scale</label><input v-model.number="form.high_noise_sample_params.guidance.txt_cfg" type="number" step="0.1" /></div>
-                            <div class="field"><label>Distilled Guidance</label><input v-model.number="form.high_noise_sample_params.guidance.distilled_guidance" type="number" step="0.1" /></div>
-                            <div class="field"><label>Image CFG</label><input v-model="form.high_noise_sample_params.guidance.img_cfg" type="number" step="0.1" placeholder="blank = follow text cfg" /></div>
-                            <div class="field"><label>SLG Layers</label><input v-model="form.high_noise_sample_params.guidance.slg_layers" placeholder="7,8,9" /></div>
-                            <div class="field"><label>SLG Layer Start</label><input v-model.number="form.high_noise_sample_params.guidance.layer_start" type="number" step="0.01" /></div>
-                            <div class="field"><label>SLG Layer End</label><input v-model.number="form.high_noise_sample_params.guidance.layer_end" type="number" step="0.01" /></div>
-                            <div class="field"><label>SLG Scale</label><input v-model.number="form.high_noise_sample_params.guidance.scale" type="number" step="0.01" /></div>
+                            <div v-if="hasFeature('distilled_guidance')" class="field"><label>Distilled Guidance</label><input v-model.number="form.high_noise_sample_params.guidance.distilled_guidance" type="number" step="0.1" /></div>
+                            <div v-if="hasFeature('img_cfg')" class="field"><label>Image CFG</label><input v-model="form.high_noise_sample_params.guidance.img_cfg" type="number" step="0.1" placeholder="blank = follow text cfg" /></div>
+                            <div v-if="hasFeature('slg')" class="field"><label>SLG Layers</label><input v-model="form.high_noise_sample_params.guidance.slg_layers" placeholder="7,8,9" /></div>
+                            <div v-if="hasFeature('slg')" class="field"><label>SLG Layer Start</label><input v-model.number="form.high_noise_sample_params.guidance.layer_start" type="number" step="0.01" /></div>
+                            <div v-if="hasFeature('slg')" class="field"><label>SLG Layer End</label><input v-model.number="form.high_noise_sample_params.guidance.layer_end" type="number" step="0.01" /></div>
+                            <div v-if="hasFeature('slg')" class="field"><label>SLG Scale</label><input v-model.number="form.high_noise_sample_params.guidance.scale" type="number" step="0.01" /></div>
                         </div>
                     </CollapsibleSection>
                 </CollapsibleSection>
 
-                <CollapsibleSection class="stack-top" eyebrow="Conditioning" :summary="conditioningSummary" :open="sectionState.conditioning" @toggle="toggleSection('conditioning')">
+                <CollapsibleSection v-if="hasConditioning" class="stack-top" eyebrow="Conditioning" :summary="conditioningSummary" :open="sectionState.conditioning" @toggle="toggleSection('conditioning')">
                     <div class="fields">
-                        <div class="field"><label>CLIP Skip</label><input v-model.number="form.clip_skip" type="number" /></div>
-                        <div class="field"><label>Strength</label><input v-model.number="form.strength" type="number" step="0.01" /></div>
-                        <div v-if="generationMode === 'image'" class="field"><label>Control Strength</label><input v-model.number="form.control_strength" type="number" step="0.01" /></div>
-                        <div v-if="generationMode === 'video'" class="field"><label>VACE Strength</label><input v-model.number="form.vace_strength" type="number" step="0.01" /></div>
+                        <div v-if="hasFeature('clip_skip')" class="field"><label>CLIP Skip</label><input v-model.number="form.clip_skip" type="number" /></div>
+                        <div v-if="hasFeature('controlnet')" class="field"><label>Control Strength</label><input v-model.number="form.control_strength" type="number" step="0.01" /></div>
+                        <div v-if="hasFeature('vace')" class="field"><label>VACE Strength</label><input v-model.number="form.vace_strength" type="number" step="0.01" /></div>
                     </div>
                 </CollapsibleSection>
 
-                <CollapsibleSection class="stack-top" eyebrow="LoRA" :summary="loraSummary" :open="sectionState.lora" @toggle="toggleSection('lora')">
+                <CollapsibleSection v-if="hasFeature('lora')" class="stack-top lora-section" eyebrow="LoRA" :summary="loraSummary" :open="sectionState.lora" @toggle="toggleSection('lora')">
                     <div v-if="!availableLoras.length" class="hint">No LoRA entries were returned by capabilities.</div>
                     <div v-else-if="!form.lora.length" class="hint">No LoRA overrides configured.</div>
-                    <div v-else class="list-editor">
+                    <div v-else class="list-editor" :class="{ 'list-editor--single-pass': !hasFeature('high_noise') }">
                         <div class="list-row list-row--header">
                             <div>LoRA</div>
                             <div>Multiplier</div>
-                            <div>High Noise</div>
+                            <div v-if="hasFeature('high_noise')">High Noise</div>
                             <div></div>
                         </div>
                         <div v-for="(item, index) in form.lora" :key="index" class="list-row">
-                            <select v-model="item.path">
-                                <option v-for="lora in availableLoras" :key="lora.path" :value="lora.path">
-                                    {{ lora.name }} ({{ lora.path }})
-                                </option>
-                            </select>
+                            <SearchableSelect :id="'lora-' + index" v-model="item.path" :aria-label="'LoRA ' + (index + 1)"
+                                :options="availableLoras.map((lora) => ({ value: lora.path, label: lora.display_path || lora.path }))"
+                                placeholder="Select a LoRA" />
                             <input v-model.number="item.multiplier" type="number" step="0.1" />
-                            <label class="checkbox list-row__checkbox">
+                            <label v-if="hasFeature('high_noise')" class="checkbox list-row__checkbox">
                                 <input v-model="item.is_high_noise" type="checkbox" />
                                 <span>{{ item.is_high_noise ? "On" : "Off" }}</span>
                             </label>
@@ -760,18 +833,23 @@ onBeforeUnmount(() => {
                     <div><button class="btn-ghost" type="button" @click="addLora" :disabled="!availableLoras.length">Add LoRA</button></div>
                 </CollapsibleSection>
 
-                <CollapsibleSection class="stack-top" eyebrow="Image Inputs" :summary="imageInputsSummary" :open="sectionState.auxiliaryImages" @toggle="toggleSection('auxiliaryImages')">
-                    <div class="upload-grid">
-                        <ImageDropzone
-                            v-for="input in gridImageInputs"
-                            :key="input.target"
-                            :label="input.label"
-                            :description="input.description"
-                            :preview="getFormImage(input.target)"
-                            @select="assignImages(input.target, $event)"
-                            @clear="clearImage(input.target)"
-                            @preview="openImageEntry($event)"
-                        />
+                <CollapsibleSection v-if="currentImageInputs.length || hasFeature('ref_images') || hasFeature('control_frames')" class="stack-top" eyebrow="Image Inputs" :summary="imageInputsSummary" :open="sectionState.auxiliaryImages" @toggle="toggleSection('auxiliaryImages')">
+                    <div v-if="gridImageInputs.length" class="upload-grid">
+                        <div v-for="input in gridImageInputs" :key="input.target" class="group">
+                            <ImageDropzone
+                                :label="input.label"
+                                :description="input.description"
+                                :preview="getFormImage(input.target)"
+                                @select="assignImages(input.target, $event)"
+                                @clear="clearImage(input.target)"
+                                @preview="openImageEntry($event)"
+                            />
+                            <div v-if="input.target === 'init_image' && hasFeature('img2img') && form.init_image" class="field">
+                                <label for="denoising-strength">Denoising Strength</label>
+                                <input id="denoising-strength" v-model.number="form.strength" type="number" min="0" max="1" step="0.01" />
+                                <div class="hint">Lower values preserve more of the initial image; higher values allow larger changes.</div>
+                            </div>
+                        </div>
                     </div>
                     <div v-for="input in fullImageInputs" :key="input.target">
                         <ImageDropzone
@@ -782,9 +860,13 @@ onBeforeUnmount(() => {
                             @clear="clearImage(input.target)"
                             @preview="openImageEntry($event)"
                         />
+                        <div v-if="input.target === 'ip_adapter_image'" class="field stack-top">
+                            <label for="ip-adapter-strength">IP-Adapter Strength</label>
+                            <input id="ip-adapter-strength" v-model.number="form.ip_adapter_strength" type="number" min="0" step="0.01" />
+                        </div>
                     </div>
 
-                    <div v-if="generationMode === 'image'" class="group">
+                    <div v-if="generationMode === 'image' && hasFeature('ref_images')" class="group">
                         <label>Reference Images</label>
                         <ImageDropzone
                             label="Reference Images"
@@ -806,9 +888,9 @@ onBeforeUnmount(() => {
                         </div>
                     </div>
 
-                    <div v-else>
-                        <div class="group">
-                            <label>Reference Images (MiniMax-H3 Ref2VA only)</label>
+                    <div v-if="generationMode === 'video'">
+                        <div v-if="hasFeature('ref_images')" class="group">
+                            <label>Reference Images</label>
                             <ImageDropzone
                                 label="Reference Images"
                                 description="Only MiniMax-H3 Ref2VA uses these images; other video models ignore them. Cannot be combined with an initial or end frame."
@@ -828,7 +910,7 @@ onBeforeUnmount(() => {
                                 </div>
                             </div>
                         </div>
-                        <div class="group stack-top">
+                        <div v-if="hasFeature('control_frames')" class="group stack-top">
                             <label>Control Frames</label>
                             <ImageDropzone
                                 label="Control Frames"
@@ -852,7 +934,7 @@ onBeforeUnmount(() => {
                     </div>
                 </CollapsibleSection>
 
-                <CollapsibleSection class="stack-top" eyebrow="VAE Tiling" :summary="vaeTilingSummary" :open="sectionState.vaeTiling" @toggle="toggleSection('vaeTiling')">
+                <CollapsibleSection v-if="hasFeature('vae_tiling')" class="stack-top" eyebrow="VAE Tiling" :summary="vaeTilingSummary" :open="sectionState.vaeTiling" @toggle="toggleSection('vaeTiling')">
                     <label class="checkbox"><input v-model="form.vae_tiling_params.enabled" type="checkbox" /><span>Enabled</span></label>
                     <div class="fields">
                         <div class="field"><label>Tile Width (px)</label><input v-model.number="form.vae_tiling_params.tile_size_w" type="number" /></div>
@@ -880,16 +962,16 @@ onBeforeUnmount(() => {
                     </div>
                 </CollapsibleSection>
 
-                <CollapsibleSection class="stack-top" eyebrow="Cache" :summary="cacheSummary" :open="sectionState.cache" @toggle="toggleSection('cache')">
+                <CollapsibleSection v-if="hasFeature('cache')" class="stack-top" eyebrow="Cache" :summary="cacheSummary" :open="sectionState.cache" @toggle="toggleSection('cache')">
                     <div class="field">
                         <label>Mode</label>
                         <select v-model="form.cache.mode">
-                            <option v-for="mode in CACHE_MODES" :key="mode" :value="mode">{{ mode }}</option>
+                            <option v-for="mode in cacheModes" :key="mode" :value="mode">{{ mode }}</option>
                         </select>
                     </div>
-                    <div class="field field--full"><label>Cache Option</label><input v-model="form.cache.option" placeholder="threshold=0.25,start=0.15,end=0.95" /></div>
-                    <div class="field"><label>SCM Mask</label><input v-model="form.cache.scm_mask" /></div>
-                    <label class="checkbox"><input v-model="form.cache.scm_policy_dynamic" type="checkbox" /><span>Dynamic SCM Policy</span></label>
+                    <div v-if="form.cache.mode !== 'disabled'" class="field field--full"><label>Cache Option</label><input v-model="form.cache.option" placeholder="threshold=0.25,start=0.15,end=0.95" /></div>
+                    <div v-if="usesSCM(form.cache.mode)" class="field"><label>SCM Mask</label><input v-model="form.cache.scm_mask" /></div>
+                    <label v-if="usesSCM(form.cache.mode)" class="checkbox"><input v-model="form.cache.scm_policy_dynamic" type="checkbox" /><span>Dynamic SCM Policy</span></label>
                 </CollapsibleSection>
             </section>
 
@@ -941,7 +1023,7 @@ onBeforeUnmount(() => {
                     </div>
                     <div class="metric">
                         <div class="metric__label">Elapsed</div>
-                        <div class="metric__value">{{ formatElapsed(currentJob?.started, currentJob?.completed) }}</div>
+                        <div class="metric__value">{{ formatElapsed(currentJob) }}</div>
                     </div>
                     <div v-if="currentJobKind === 'vid_gen'" class="metric">
                         <div class="metric__label">FPS</div>
@@ -957,7 +1039,7 @@ onBeforeUnmount(() => {
                 <div v-else-if="currentJob?.error?.message" class="status-message status-message--error">{{ currentJob.error.message }}</div>
 
                 <div class="output-controls">
-                    <button class="btn output-controls__primary" type="button" :disabled="isJobRunning" @click="generate">
+                    <button class="btn output-controls__primary" type="button" :disabled="isJobRunning || !canGenerate" @click="generate">
                         {{ generationMode === "video" ? "Generate Video" : "Generate Image" }}
                     </button>
                     <div class="actions output-controls__secondary">

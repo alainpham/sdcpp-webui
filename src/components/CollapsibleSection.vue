@@ -43,7 +43,7 @@ function onToggle(): void {
 
 <template>
     <div :class="rootClass[variant] || rootClass.section">
-        <button :class="buttonClass[variant] || buttonClass.section" type="button" @click="onToggle">
+        <button :class="buttonClass[variant] || buttonClass.section" type="button" :aria-expanded="open" @click="onToggle">
             <span v-if="$slots.header" class="module-card__copy">
                 <slot name="header" />
             </span>

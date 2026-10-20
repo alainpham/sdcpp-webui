@@ -14,6 +14,7 @@ export type ImageTarget =
   | "init_image"
   | "mask_image"
   | "control_image"
+  | "ip_adapter_image"
   | "end_image"
   | "ref_images"
   | "control_frames";
@@ -85,6 +86,7 @@ export interface GenerationForm {
   clip_skip: number;
   strength: number;
   control_strength: number;
+  ip_adapter_strength: number;
   moe_boundary: number;
   vace_strength: number;
   output_format: string;
@@ -99,6 +101,7 @@ export interface GenerationForm {
   control_frames: ImageEntry[];
   mask_image: ImageEntry | null;
   control_image: ImageEntry | null;
+  ip_adapter_image: ImageEntry | null;
   lora: FormLoraEntry[];
   vae_tiling_params: VaeTilingParams;
   cache: CacheParams;
@@ -111,13 +114,18 @@ export interface GenerationForm {
 export interface AvailableLora {
   name: string;
   path: string;
+  display_path?: string;
 }
 
 // ---------------------------------------------------------------------------
 // Capabilities (API response)
 // ---------------------------------------------------------------------------
 
+export type GenerationFeatures = Record<string, boolean>;
+
 export interface Capabilities {
+  generation_features?: GenerationFeatures;
+  runtime?: ModelStatus;
   model?: {
     stem?: string;
     name?: string;
@@ -189,3 +197,50 @@ export interface Job {
 // ---------------------------------------------------------------------------
 
 export type CacheMode = (typeof CACHE_MODES)[number];
+
+export interface ModelStatus {
+  state: "empty" | "loading" | "ready" | "error";
+  recipe: string | null;
+  models: Record<string, string>;
+  error: string | null;
+  origin?: string;
+  runtime_recipe?: Recipe;
+  load_elapsed_seconds?: number | null;
+}
+export interface RecipeDefaults {
+  strength?: number;
+  moe_boundary?: number;
+  width?: number;
+  height?: number;
+  steps?: number;
+  custom_sigmas?: number[];
+  cfg_scale?: number;
+  img_cfg_scale?: number;
+  distilled_guidance?: number;
+  sampling_method?: string;
+  scheduler?: string;
+  video_frames?: number;
+  fps?: number;
+  flow_shift?: number;
+  shifted_timestep?: number;
+  high_noise_steps?: number;
+  high_noise_cfg_scale?: number;
+  high_noise_flow_shift?: number;
+  high_noise_sampling_method?: string;
+  high_noise_scheduler?: string;
+}
+export interface Recipe {
+  id: string;
+  name: string;
+  description?: string;
+  model_url?: string;
+  required_any?: string[][];
+  source: "builtin" | "user" | "command_line";
+  defaults?: RecipeDefaults;
+  features?: string[];
+  disabled_features?: string[];
+  effective_features?: GenerationFeatures;
+  slots: { id: string; label: string; category: string; categories?: string[]; required: boolean }[];
+}
+export interface ModelFile { id: string; name?: string; category: string; }
+export interface CatalogError { file: string; message: string; }

@@ -819,11 +819,32 @@ button {
     padding: 0;
 }
 
+.lora-section.module-card {
+    overflow: visible;
+}
+
+.lora-section > .advanced-group__toggle {
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
+}
+
+.lora-section > .advanced-group__toggle[aria-expanded="false"] {
+    border-bottom: 0;
+    border-radius: var(--radius-md);
+}
+
+.lora-section > .advanced-group__content {
+    border-radius: 0 0 var(--radius-md) var(--radius-md);
+}
+
 .list-editor {
     display: grid;
     grid-template-columns: minmax(0, 1.6fr) minmax(96px, 0.8fr) auto auto;
     gap: 10px;
     min-width: 0;
+}
+
+.list-editor--single-pass {
+    grid-template-columns: minmax(0, 1.6fr) minmax(96px, 0.8fr) auto;
 }
 
 .list-row {
