@@ -6,7 +6,21 @@ import ModelSelector from "./components/ModelSelector.vue";
 import SearchableSelect from "./components/SearchableSelect.vue";
 import ImageDropzone from "./components/ImageDropzone.vue";
 import StatusChip from "./components/StatusChip.vue";
-import { cancelJob, getCapabilities, getJob, submitImageJob, submitVideoJob } from "./lib/api";
+import {
+    cancelJob,
+    getCapabilities,
+    getJob,
+    getHistorySettings,
+    getImageHistory,
+    getSettingsPresets,
+    getWebUiSettings,
+    deleteHistoryImage as deleteHistoryImageRequest,
+    imageHistoryUrl,
+    saveWebUiSettings,
+    saveSettingsPreset as saveSettingsPresetRequest,
+    submitImageJob,
+    submitVideoJob,
+} from "./lib/api";
 import { applyRecipeDefaults, buildRequestBodyForMode, createBlankForm, formFromCapabilities } from "./lib/form";
 import { availableCacheModes, featuresForMode, supportsEta, supportsFlowShift, usesSCM } from "./lib/generation-features";
 import { IMAGE_INPUTS, VIDEO_IMAGE_INPUTS } from "./lib/image-inputs";
@@ -20,10 +34,13 @@ import type {
     GenerationForm,
     GenerationFeatures,
     GenerationMode,
+    HistoryImage,
     ImageEntry,
     ImageTarget,
     Job,
     SampleParams,
+    SettingsPreset,
+    WebUiSettings,
 } from "./lib/types";
 
 const baseUrl = createStoredRef<string>("sdcpp-webui-base-url", "", (value: unknown) => String(value || ""));
@@ -35,6 +52,7 @@ const generationMode = computed<GenerationMode>(() => selectedGenerationTab.valu
 const lightboxOpen = ref(false);
 const lightboxImageSrc = ref("");
 const lightboxImageAlt = ref("");
+const historyLightboxOpen = ref(false);
 const sectionState = reactive<Record<string, boolean>>({
     sample: true,
     sampleAdvanced: false,
@@ -60,6 +78,23 @@ const applyRecipeDefaultsOnSelect = createStoredRef<boolean>("sdcpp-webui-apply-
 const modelSelection = ref<Record<string, string>>({});
 const modelReady = computed(() => modelStatus.value ? modelStatus.value.state === "ready" : Boolean(capabilities.value?.model?.name));
 const currentJob = ref<Job | null>(null);
+const settingsError = ref("");
+const savingDefaultSettings = ref(false);
+const settingsPresets = ref<SettingsPreset[]>([]);
+const selectedPresetName = ref("");
+const presetName = ref("");
+const presetError = ref("");
+const presetStatus = ref("");
+const historyImages = ref<HistoryImage[]>([]);
+const selectedHistoryIndex = ref(-1);
+const historyLoading = ref(false);
+const historyLightboxDeleteLoading = ref(false);
+const historyError = ref("");
+const historyImageSettings = ref<WebUiSettings | null>(null);
+const historySettingsLoading = ref(false);
+const historySettingsError = ref("");
+const historyLoadFeedback = ref("");
+const historyDetailsVisible = ref(false);
 const selectedOutputIndex = ref(0);
 const statusMessage = ref("");
 const statusTone = ref("");
@@ -70,6 +105,10 @@ const form = reactive<GenerationForm>(createBlankForm());
 let pollTimer = 0;
 let elapsedTimer = 0;
 const nowMilliseconds = ref(Date.now());
+let formInitialized = false;
+let historySettingsRequestId = 0;
+let historyRevision = 0;
+const pendingHistoryDeletes = new Set<string>();
 
 const modelName = computed(() => {
     const model = capabilities.value?.model;
@@ -142,6 +181,21 @@ const previewModes = computed(() => (capabilities.value?.preview_modes || ["none
 const currentStatus = computed(() => currentJob.value?.status || "idle");
 const currentJobKind = computed(() => currentJob.value?.kind || null);
 const currentImages = computed(() => currentJobKind.value === "img_gen" ? currentJob.value?.result?.images || [] : []);
+const selectedHistoryImage = computed(() => historyImages.value[selectedHistoryIndex.value] || null);
+const historyImageSrc = computed(() => selectedHistoryImage.value
+    ? imageHistoryUrl(baseUrl.value, selectedHistoryImage.value.filename)
+    : null);
+const historyImageDetails = computed(() => {
+    const savedForm = historyImageSettings.value?.form;
+    const sample = savedForm?.sample_params;
+    return {
+        cfgScale: sample?.guidance?.txt_cfg ?? "—",
+        steps: sample?.sample_steps ?? "—",
+        scheduler: sample?.scheduler || "—",
+        method: sample?.sample_method || "—",
+        seed: savedForm?.seed ?? "—",
+    };
+});
 const selectedImage = computed(() => {
     if (!currentImages.value.length) {
         return null;
@@ -186,6 +240,9 @@ const livePreviewPass = computed(() => currentJob.value?.preview?.pass ?? 1);
 const livePreviewStep = computed(() => currentJob.value?.preview?.step ?? 0);
 const livePreviewTotalSteps = computed(() => currentJob.value?.preview?.total_steps ?? 0);
 const downloadableSrc = computed(() => {
+    if (historyLightboxOpen.value) {
+        return historyImageSrc.value;
+    }
     const result = currentJob.value?.result;
     if (currentJobKind.value === "vid_gen" && result?.b64_json && videoMimeType.value) {
         return `data:${videoMimeType.value};base64,${result.b64_json}`;
@@ -214,10 +271,11 @@ function buildSampleSummary(sample: SampleParams): string {
     const scheduler = sample.scheduler || "default";
     const method = sample.sample_method || "default";
     const steps = sample.sample_steps || 0;
+    const schedule = String(sample.custom_sigmas || "").trim() ? "custom sigmas" : scheduler;
     const flowShift = sample.flow_shift === "" || sample.flow_shift == null
         ? "flow auto"
         : `flow ${sample.flow_shift}`;
-    return [scheduler, ...(sampleHasFlowShift(sample) ? [flowShift] : []), method, `${steps} steps`].join(" · ");
+    return [schedule, ...(sampleHasFlowShift(sample) ? [flowShift] : []), method, `${steps} steps`].join(" · ");
 }
 
 function buildGuidanceSummary(sample: SampleParams): string {
@@ -320,8 +378,331 @@ function deepAssign(target: Record<string, any>, ...sources: Record<string, any>
     return target;
 }
 
-function applyForm(nextForm: GenerationForm): void {
-    deepAssign(form, createBlankForm(), nextForm);
+function applyForm(nextForm: Partial<GenerationForm>, reset = false): void {
+    if (reset) {
+        deepAssign(form, createBlankForm(), nextForm);
+        return;
+    }
+    deepAssign(form, nextForm);
+}
+
+function normalizeCustomSigmas(value: unknown): string {
+    if (Array.isArray(value)) {
+        return value.join(", ");
+    }
+    return typeof value === "string" ? value.trim() : "";
+}
+
+function currentWebUiSettings(): WebUiSettings {
+    const savedForm = {
+        ...form,
+        init_image: undefined,
+        end_image: undefined,
+        ref_images: undefined,
+        control_frames: undefined,
+        mask_image: undefined,
+        control_image: undefined,
+        ip_adapter_image: undefined,
+    };
+    return {
+        form: JSON.parse(JSON.stringify(savedForm)) as Partial<GenerationForm>,
+        generation_mode: selectedGenerationTab.value,
+    };
+}
+
+function applyWebUiSettings(settings: WebUiSettings): void {
+    applyForm({
+        ...settings.form,
+        sample_params: {
+            ...form.sample_params,
+            ...settings.form.sample_params,
+            custom_sigmas: normalizeCustomSigmas(settings.form.sample_params?.custom_sigmas),
+        },
+        high_noise_sample_params: {
+            ...form.high_noise_sample_params,
+            ...settings.form.high_noise_sample_params,
+            custom_sigmas: normalizeCustomSigmas(settings.form.high_noise_sample_params?.custom_sigmas),
+        },
+        init_image: null,
+        end_image: null,
+        ref_images: [],
+        control_frames: [],
+        mask_image: null,
+        control_image: null,
+        ip_adapter_image: null,
+    });
+
+    const requestedMode = settings.generation_mode;
+    let appliedMode: GenerationMode;
+    if (requestedMode === "image" && supportsImageMode.value) {
+        appliedMode = "image";
+    } else if (requestedMode === "video" && supportsVideoMode.value) {
+        appliedMode = "video";
+    } else {
+        appliedMode = supportsVideoMode.value ? "video" : "image";
+    }
+    selectedGenerationTab.value = appliedMode;
+    if (activeTab.value !== "settings") {
+        activeTab.value = appliedMode;
+    }
+    ensureOutputFormatForMode();
+}
+
+async function refreshSettingsPresets(): Promise<void> {
+    try {
+        const response = await getSettingsPresets(baseUrl.value);
+        const currentSelection = selectedPresetName.value;
+        settingsPresets.value = response.presets || [];
+        if (settingsPresets.value.some((preset) => preset.name === currentSelection)) {
+            selectedPresetName.value = currentSelection;
+        } else {
+            selectedPresetName.value = settingsPresets.value[0]?.name || "";
+        }
+        presetError.value = "";
+    } catch (error) {
+        presetError.value = error instanceof Error ? error.message : String(error);
+    }
+}
+
+async function saveCurrentPreset(): Promise<void> {
+    const name = presetName.value.trim();
+    if (!name) {
+        presetError.value = "Enter a name for this preset.";
+        return;
+    }
+    try {
+        await saveSettingsPresetRequest(baseUrl.value, name, currentWebUiSettings());
+        await refreshSettingsPresets();
+        selectedPresetName.value = name;
+        presetName.value = name;
+        presetStatus.value = `Saved preset “${name}”.`;
+        presetError.value = "";
+    } catch (error) {
+        presetError.value = error instanceof Error ? error.message : String(error);
+    }
+}
+
+async function saveCurrentSettingsAsDefault(): Promise<void> {
+    savingDefaultSettings.value = true;
+    settingsError.value = "";
+    try {
+        await saveWebUiSettings(baseUrl.value, currentWebUiSettings());
+        setMessage("Saved current settings as defaults. They will load on the next refresh.", "success");
+    } catch (error) {
+        settingsError.value = error instanceof Error ? error.message : String(error);
+        setMessage(`Could not save default settings: ${settingsError.value}`, "error");
+    } finally {
+        savingDefaultSettings.value = false;
+    }
+}
+
+function loadSelectedPreset(): void {
+    const preset = settingsPresets.value.find((item) => item.name === selectedPresetName.value);
+    if (!preset) {
+        presetError.value = "Choose a saved preset first.";
+        return;
+    }
+    applyWebUiSettings(preset.settings);
+    presetName.value = preset.name;
+    presetStatus.value = `Loaded preset “${preset.name}”.`;
+    presetError.value = "";
+}
+
+async function refreshHistory(): Promise<void> {
+    historyLoading.value = true;
+    historyError.value = "";
+    const selectedFilename = selectedHistoryImage.value?.filename;
+    try {
+        let revision = historyRevision;
+        let response = await getImageHistory(baseUrl.value);
+        while (revision !== historyRevision) {
+            revision = historyRevision;
+            response = await getImageHistory(baseUrl.value);
+        }
+        historyImages.value = response.images || [];
+        if (selectedFilename) {
+            selectedHistoryIndex.value = historyImages.value.findIndex((image) => image.filename === selectedFilename);
+            if (selectedHistoryIndex.value < 0 && historyLightboxOpen.value) {
+                closeLightbox();
+            }
+        } else if (historyImages.value.length && selectedHistoryIndex.value < 0) {
+            selectedHistoryIndex.value = 0;
+        }
+        if (!historyImages.value.length) {
+            selectedHistoryIndex.value = -1;
+            if (historyLightboxOpen.value) {
+                closeLightbox();
+            }
+        }
+    } catch (error) {
+        historyError.value = error instanceof Error ? error.message : String(error);
+    } finally {
+        historyLoading.value = false;
+    }
+}
+
+function addCompletedJobImagesToHistory(job: Job): void {
+    if (job.kind !== "img_gen") {
+        return;
+    }
+    const filenames = [
+        ...(job.completed_images || []),
+        ...(job.result?.images || []).map((image) => image.filename || ""),
+    ].filter(Boolean);
+    if (!filenames.length) {
+        return;
+    }
+
+    const existingFilenames = new Set(historyImages.value.map((image) => image.filename));
+    const newImages = [...new Set(filenames)]
+        .filter((filename) => !existingFilenames.has(filename))
+        .map((filename) => ({ filename }));
+    if (!newImages.length) {
+        return;
+    }
+
+    const selectedFilename = selectedHistoryImage.value?.filename;
+    historyRevision += 1;
+    historyImages.value = [...historyImages.value, ...newImages]
+        .sort((left, right) => right.filename.localeCompare(left.filename));
+    if (selectedFilename) {
+        selectedHistoryIndex.value = historyImages.value.findIndex((image) => image.filename === selectedFilename);
+    } else if (selectedHistoryIndex.value < 0) {
+        selectedHistoryIndex.value = 0;
+    }
+}
+
+function openHistoryImage(filename: string): void {
+    const index = historyImages.value.findIndex((image) => image.filename === filename);
+    if (index < 0 || index >= historyImages.value.length) {
+        return;
+    }
+    selectedHistoryIndex.value = index;
+    historyLightboxOpen.value = true;
+    historyDetailsVisible.value = false;
+    lightboxOpen.value = true;
+}
+
+function moveHistorySelection(offset: number): void {
+    const nextIndex = selectedHistoryIndex.value + offset;
+    if (nextIndex >= 0 && nextIndex < historyImages.value.length) {
+        selectedHistoryIndex.value = nextIndex;
+    }
+}
+
+async function refreshSelectedHistorySettings(): Promise<void> {
+    const requestId = ++historySettingsRequestId;
+    const image = historyLightboxOpen.value ? selectedHistoryImage.value : null;
+    historyImageSettings.value = null;
+    historySettingsError.value = "";
+    historyLoadFeedback.value = "";
+    if (!image) {
+        historySettingsLoading.value = false;
+        return;
+    }
+
+    historySettingsLoading.value = true;
+    try {
+        const settings = await getHistorySettings(baseUrl.value, image.filename);
+        if (requestId === historySettingsRequestId) {
+            historyImageSettings.value = settings;
+        }
+    } catch (error) {
+        if (requestId === historySettingsRequestId) {
+            historySettingsError.value = error instanceof Error ? error.message : String(error);
+        }
+    } finally {
+        if (requestId === historySettingsRequestId) {
+            historySettingsLoading.value = false;
+        }
+    }
+}
+
+async function deleteHistoryImage(image: HistoryImage, fromLightbox = false): Promise<void> {
+    if (pendingHistoryDeletes.has(image.filename)) {
+        return;
+    }
+    pendingHistoryDeletes.add(image.filename);
+
+    const index = historyImages.value.findIndex((entry) => entry.filename === image.filename);
+    const selectedFilename = selectedHistoryImage.value?.filename;
+    const selectedWasDeleted = selectedFilename === image.filename;
+    const wasHistoryLightboxOpen = historyLightboxOpen.value;
+    if (fromLightbox) {
+        historyLightboxDeleteLoading.value = true;
+    }
+
+    if (index >= 0) {
+        historyRevision += 1;
+    }
+    historyImages.value = historyImages.value.filter((entry) => entry.filename !== image.filename);
+    if (!historyImages.value.length) {
+        selectedHistoryIndex.value = -1;
+        if (historyLightboxOpen.value) {
+            closeLightbox();
+        }
+    } else if (selectedWasDeleted) {
+        selectedHistoryIndex.value = Math.min(index, historyImages.value.length - 1);
+        if (wasHistoryLightboxOpen) {
+            historyLightboxOpen.value = true;
+            lightboxOpen.value = true;
+        }
+    } else if (selectedFilename) {
+        selectedHistoryIndex.value = historyImages.value.findIndex((entry) => entry.filename === selectedFilename);
+    } else {
+        selectedHistoryIndex.value = Math.min(Math.max(index, 0), historyImages.value.length - 1);
+    }
+
+    try {
+        await deleteHistoryImageRequest(baseUrl.value, image.filename);
+        setMessage(`Deleted ${image.filename}.`, "success");
+    } catch (error) {
+        await refreshHistory();
+        setMessage(error instanceof Error ? error.message : String(error), "error");
+    } finally {
+        pendingHistoryDeletes.delete(image.filename);
+        if (fromLightbox) {
+            historyLightboxDeleteLoading.value = false;
+        }
+    }
+}
+
+function deleteSelectedHistoryImage(): void {
+    const image = selectedHistoryImage.value;
+    if (image) {
+        deleteHistoryImage(image, true);
+    }
+}
+
+function reloadHistorySettings(): void {
+    const image = selectedHistoryImage.value;
+    const settings = historyImageSettings.value;
+    if (!image || !settings) {
+        return;
+    }
+    applyWebUiSettings(settings);
+    historyLoadFeedback.value = `Loaded all settings from ${image.filename}.`;
+}
+
+function loadHistoryPrompts(includeSeed: boolean): void {
+    const image = selectedHistoryImage.value;
+    const savedForm = historyImageSettings.value?.form;
+    if (!image || !savedForm) {
+        return;
+    }
+
+    form.prompt = savedForm.prompt ?? "";
+    form.negative_prompt = savedForm.negative_prompt ?? "";
+    const savedSeed = savedForm.seed;
+    const hasSavedSeed = typeof savedSeed === "number" && Number.isFinite(savedSeed);
+    if (includeSeed && typeof savedSeed === "number" && Number.isFinite(savedSeed)) {
+        form.seed = savedSeed;
+    }
+    if (includeSeed && !hasSavedSeed) {
+        historyLoadFeedback.value = `Loaded prompts from ${image.filename}; no saved seed was available.`;
+        return;
+    }
+    historyLoadFeedback.value = `Loaded ${includeSeed ? "prompts and seed" : "prompts"} from ${image.filename}.`;
 }
 
 function updateCatalogRecipe(recipe: Recipe | null): void {
@@ -360,11 +741,21 @@ async function refreshCapabilities(): Promise<void> {
             const defaults = formFromCapabilities(response);
             defaults.prompt = form.prompt || defaults.prompt;
             defaults.negative_prompt = form.negative_prompt || defaults.negative_prompt;
-            applyForm(defaults);
+            applyForm(defaults, true);
             if (selectedRecipe.value && applyRecipeDefaultsOnSelect.value) applyRecipeDefaults(form, selectedRecipe.value.defaults);
         }
         if (response.runtime?.runtime_recipe && (enteringCommandLine || !selectedRecipe.value)) {
             selectRecipe(response.runtime.runtime_recipe);
+        }
+        if (!formInitialized) {
+            try {
+                const savedSettings = await getWebUiSettings(baseUrl.value);
+                applyWebUiSettings(savedSettings);
+                settingsError.value = "";
+            } catch (error) {
+                settingsError.value = error instanceof Error ? error.message : String(error);
+            }
+            formInitialized = true;
         }
         if (selectedGenerationTab.value === "image" && !supportsImageMode.value && supportsVideoMode.value) {
             selectedGenerationTab.value = "video";
@@ -434,6 +825,7 @@ async function pollJob(id: string): Promise<void> {
         const job = await getJob(baseUrl.value, id);
         if (version !== pollVersion) return;
         currentJob.value = job;
+        addCompletedJobImagesToHistory(job);
         serviceOnline.value = true;
         if (currentStatus.value === "queued" || currentStatus.value === "generating") {
             pollTimer = window.setTimeout(() => pollJob(id), normalizePollIntervalMs(pollIntervalMs.value));
@@ -446,7 +838,16 @@ async function pollJob(id: string): Promise<void> {
         }
         stopElapsedTimer();
         if (currentStatus.value === "completed") {
-            setMessage(currentJob.value?.kind === "vid_gen" ? "Video generation completed." : "Image generation completed.", "success");
+            if (currentJob.value?.kind === "vid_gen") {
+                setMessage("Video generation completed.", "success");
+            } else {
+                const saveError = currentJob.value?.result?.save_error;
+                if (saveError) {
+                    setMessage(`Image generated, but saving to sdoutput failed: ${saveError}`, "error");
+                } else {
+                    setMessage("Image generation completed and saved to sdoutput.", "success");
+                }
+            }
             return;
         }
         if (currentStatus.value === "cancelled") {
@@ -471,7 +872,11 @@ async function pollJob(id: string): Promise<void> {
 async function generate(): Promise<void> {
     if (!canGenerate.value || isJobRunning.value) return;
     try {
-        const request = buildRequestBodyForMode(generationMode.value, form, generationFeatures.value);
+        closeLightbox();
+        const request = {
+            ...buildRequestBodyForMode(generationMode.value, form, generationFeatures.value),
+            ui_settings: currentWebUiSettings(),
+        };
         clearMessage();
         selectedOutputIndex.value = 0;
         startElapsedTimer();
@@ -575,7 +980,9 @@ function downloadSelected(): void {
     }
     const link = document.createElement("a");
     link.href = downloadableSrc.value;
-    link.download = `${currentJob.value?.id || "output"}.${currentJob.value?.result?.output_format || form.output_format}`;
+    link.download = historyLightboxOpen.value && selectedHistoryImage.value
+        ? selectedHistoryImage.value.filename
+        : `${currentJob.value?.id || "output"}.${currentJob.value?.result?.output_format || form.output_format}`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -585,6 +992,7 @@ function openLightbox(src: string | null | undefined = previewImageSrc.value, al
     if (!src) {
         return;
     }
+    historyLightboxOpen.value = false;
     lightboxImageSrc.value = src;
     lightboxImageAlt.value = alt;
     lightboxOpen.value = true;
@@ -592,8 +1000,30 @@ function openLightbox(src: string | null | undefined = previewImageSrc.value, al
 
 function closeLightbox(): void {
     lightboxOpen.value = false;
+    historyLightboxOpen.value = false;
+    historyDetailsVisible.value = false;
     lightboxImageSrc.value = "";
     lightboxImageAlt.value = "";
+}
+
+function onLightboxKeydown(event: KeyboardEvent): void {
+    if (!lightboxOpen.value) {
+        return;
+    }
+    if (event.key === "Escape") {
+        closeLightbox();
+        return;
+    }
+    if (!historyLightboxOpen.value) {
+        return;
+    }
+    if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        moveHistorySelection(-1);
+    } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        moveHistorySelection(1);
+    }
 }
 
 async function onPaste(event: ClipboardEvent): Promise<void> {
@@ -624,15 +1054,27 @@ watch(videoOutputFormats, () => {
     ensureOutputFormatForMode();
 });
 
+watch(
+    () => `${historyLightboxOpen.value ? "open" : "closed"}|${selectedHistoryImage.value?.filename || ""}|${baseUrl.value}`,
+    () => {
+        void refreshSelectedHistorySettings();
+    },
+);
+
 onMounted(() => {
     window.addEventListener("paste", onPaste);
+    window.addEventListener("keydown", onLightboxKeydown);
     refreshCapabilities();
+    refreshSettingsPresets();
+    refreshHistory();
 });
 
 onBeforeUnmount(() => {
     stopPolling();
     stopElapsedTimer();
+    historySettingsRequestId += 1;
     window.removeEventListener("paste", onPaste);
+    window.removeEventListener("keydown", onLightboxKeydown);
 });
 </script>
 
@@ -665,6 +1107,34 @@ onBeforeUnmount(() => {
                 </div>
             </div>
             <div v-if="activeTab === 'settings'" class="settings">
+                <section class="settings-presets">
+                    <div class="panel-header">
+                        <div>
+                            <h2 class="panel-title">Settings Presets</h2>
+                            <p class="hint">Save the current generation options under a name, then load them later.</p>
+                        </div>
+                    </div>
+                    <div class="fields">
+                        <div class="field">
+                            <label>Saved Preset</label>
+                            <select v-model="selectedPresetName">
+                                <option value="">Choose a preset</option>
+                                <option v-for="preset in settingsPresets" :key="preset.name" :value="preset.name">{{ preset.name }}</option>
+                            </select>
+                        </div>
+                        <div class="field">
+                            <label>Preset Name</label>
+                            <input v-model="presetName" maxlength="80" placeholder="e.g. Portrait fast" />
+                        </div>
+                    </div>
+                    <div class="actions settings-presets__actions">
+                        <button class="btn-secondary" type="button" @click="loadSelectedPreset" :disabled="!selectedPresetName">Load Preset</button>
+                        <button class="btn-secondary" type="button" @click="refreshSettingsPresets">Refresh List</button>
+                        <button class="btn" type="button" @click="saveCurrentPreset">Save Current Settings</button>
+                    </div>
+                    <div v-if="presetError" class="status-message status-message--error">{{ presetError }}</div>
+                    <div v-else-if="presetStatus" class="status-message status-message--success">{{ presetStatus }}</div>
+                </section>
                 <div class="settings__grid">
                     <div class="field">
                         <label for="theme">Theme</label>
@@ -702,6 +1172,8 @@ onBeforeUnmount(() => {
                     </div>
                 </div>
                 <div v-if="capabilitiesError" class="status-message status-message--error">{{ capabilitiesError }}</div>
+                <div class="hint">Click Set as Default on the main screen to save the current generation settings in sdcpp-webui-settings.json. Uploaded images are not saved.</div>
+                <div v-if="settingsError" class="status-message status-message--error">Could not save or load settings: {{ settingsError }}</div>
             </div>
         </header>
 
@@ -771,6 +1243,11 @@ onBeforeUnmount(() => {
                             </select>
                         </div>
                         <div class="field"><label>Steps</label><input v-model.number="form.sample_params.sample_steps" type="number" /></div>
+                    </div>
+                    <div class="field field--full stack-top">
+                        <label>Custom sigmas</label>
+                        <input v-model="form.sample_params.custom_sigmas" type="text" placeholder="blank = use selected scheduler" />
+                        <p class="hint">Comma-separated values override the scheduler. The number of steps is one less than the number of values.</p>
                     </div>
                     <div v-if="sampleHasExtras(form.sample_params)" class="sample-panel__extras">
                         <button class="module-card__link" type="button" @click="toggleSection('sampleAdvanced')">
@@ -1088,6 +1565,9 @@ onBeforeUnmount(() => {
                         <button class="btn-secondary" type="button" :disabled="!downloadableSrc" @click="downloadSelected">Download</button>
                         <button class="btn-danger" type="button" :disabled="!canCancelCurrentJob" @click="cancelCurrentJob">{{ cancelling || (isJobRunning && currentJob?.cancel_requested) ? "Cancelling…" : "Cancel" }}</button>
                     </div>
+                    <button class="btn-secondary output-controls__default" type="button" :disabled="savingDefaultSettings || !serviceOnline" @click="saveCurrentSettingsAsDefault">
+                        {{ savingDefaultSettings ? "Saving Defaults…" : "Set as Default" }}
+                    </button>
                 </div>
 
                 <div v-if="currentImages.length > 1" class="thumb-row">
@@ -1095,11 +1575,117 @@ onBeforeUnmount(() => {
                         <img :src="`data:image/${currentJob?.result?.output_format || 'png'};base64,${image.b64_json}`" :alt="`Output ${index + 1}`" />
                     </button>
                 </div>
+
+                <section class="history-gallery">
+                    <div class="history-gallery__header">
+                        <div>
+                            <h3>Image History</h3>
+                            <span>{{ historyImages.length }} saved {{ historyImages.length === 1 ? "image" : "images" }}</span>
+                        </div>
+                        <button class="btn-secondary" type="button" @click="refreshHistory" :disabled="historyLoading">
+                            {{ historyLoading ? "Refreshing..." : "Refresh" }}
+                        </button>
+                    </div>
+                    <div v-if="historyError" class="status-message status-message--error">{{ historyError }}</div>
+                    <div v-else-if="!historyImages.length" class="hint">Generated images will appear here.</div>
+                    <div v-else class="history-grid">
+                        <div
+                            v-for="(image, index) in historyImages"
+                            :key="image.filename"
+                            v-memo="[historyLightboxOpen && selectedHistoryImage?.filename === image.filename]"
+                            class="history-card"
+                            :class="{ 'history-card--active': historyLightboxOpen && selectedHistoryImage?.filename === image.filename }"
+                        >
+                            <button class="history-card__open" type="button" @click="openHistoryImage(image.filename)">
+                                <img :src="imageHistoryUrl(baseUrl, image.filename, true)" :alt="image.filename" loading="lazy" />
+                                <span>{{ image.filename.replace(/\.png$/i, "") }}</span>
+                            </button>
+                            <button
+                                class="history-card__delete"
+                                type="button"
+                                :aria-label="`Delete ${image.filename}`"
+                                @click="deleteHistoryImage(image)"
+                            >Delete</button>
+                        </div>
+                    </div>
+                </section>
             </section>
         </div>
-        <div v-if="lightboxOpen && lightboxImageSrc" class="lightbox" @click.self="closeLightbox">
+        <div
+            v-if="lightboxOpen && (historyLightboxOpen ? historyImageSrc : lightboxImageSrc)"
+            class="lightbox"
+            @click.self="closeLightbox"
+        >
             <button class="lightbox__close" type="button" @click="closeLightbox">Close</button>
-            <img class="lightbox__image" :src="lightboxImageSrc" :alt="lightboxImageAlt" />
+            <img
+                class="lightbox__image"
+                :class="{
+                    'lightbox__image--history': historyLightboxOpen,
+                    'lightbox__image--history-details-visible': historyLightboxOpen && historyDetailsVisible,
+                }"
+                :src="(historyLightboxOpen ? historyImageSrc : lightboxImageSrc) || ''"
+                :alt="historyLightboxOpen ? selectedHistoryImage?.filename : lightboxImageAlt"
+            />
+            <div v-if="historyLightboxOpen && selectedHistoryImage" class="lightbox__history-controls">
+                <div class="lightbox__history-navigation">
+                    <button
+                        class="lightbox__history-button"
+                        type="button"
+                        aria-label="Previous image"
+                        :disabled="selectedHistoryIndex <= 0"
+                        @click="moveHistorySelection(-1)"
+                    >‹</button>
+                    <span class="lightbox__history-label">{{ selectedHistoryImage.filename }} · {{ selectedHistoryIndex + 1 }} / {{ historyImages.length }}</span>
+                    <button
+                        class="lightbox__history-button"
+                        type="button"
+                        aria-label="Next image"
+                        :disabled="selectedHistoryIndex >= historyImages.length - 1"
+                        @click="moveHistorySelection(1)"
+                    >›</button>
+                    <button
+                        class="lightbox__history-button lightbox__history-toggle"
+                        type="button"
+                        :aria-expanded="historyDetailsVisible"
+                        @click="historyDetailsVisible = !historyDetailsVisible"
+                    >{{ historyDetailsVisible ? "Hide Info" : "Show Info" }}</button>
+                </div>
+                <section v-if="historyDetailsVisible" class="lightbox__history-details" aria-label="Image generation settings">
+                    <div v-if="historySettingsLoading" class="lightbox__history-message">Loading image settings…</div>
+                    <div v-else-if="historySettingsError" class="lightbox__history-message lightbox__history-message--error">{{ historySettingsError }}</div>
+                    <template v-else-if="historyImageSettings">
+                        <div class="lightbox__history-prompts">
+                            <label>
+                                <span>Prompt</span>
+                                <textarea readonly rows="2" :value="historyImageSettings.form.prompt || ''"></textarea>
+                            </label>
+                            <label>
+                                <span>Negative Prompt</span>
+                                <textarea readonly rows="2" :value="historyImageSettings.form.negative_prompt || ''"></textarea>
+                            </label>
+                        </div>
+                        <dl class="lightbox__history-metadata">
+                            <div><dt>CFG Scale</dt><dd>{{ historyImageDetails.cfgScale }}</dd></div>
+                            <div><dt>Steps</dt><dd>{{ historyImageDetails.steps }}</dd></div>
+                            <div><dt>Scheduler</dt><dd>{{ historyImageDetails.scheduler }}</dd></div>
+                            <div><dt>Sampling Method</dt><dd>{{ historyImageDetails.method }}</dd></div>
+                            <div><dt>Seed</dt><dd>{{ historyImageDetails.seed }}</dd></div>
+                        </dl>
+                    </template>
+                </section>
+                <div class="lightbox__history-actions">
+                    <button class="lightbox__history-button" type="button" :disabled="historySettingsLoading || !historyImageSettings" @click="reloadHistorySettings">Load All Settings</button>
+                    <button class="lightbox__history-button" type="button" :disabled="historySettingsLoading || !historyImageSettings" @click="loadHistoryPrompts(false)">Load Prompts</button>
+                    <button class="lightbox__history-button" type="button" :disabled="historySettingsLoading || !historyImageSettings" @click="loadHistoryPrompts(true)">Load Prompts + Seed</button>
+                    <button
+                        class="lightbox__history-button lightbox__history-button--delete"
+                        type="button"
+                        :disabled="historyLightboxDeleteLoading"
+                        @click="deleteSelectedHistoryImage"
+                    >Delete</button>
+                </div>
+                <div v-if="historyLoadFeedback" class="lightbox__history-feedback" role="status">{{ historyLoadFeedback }}</div>
+            </div>
         </div>
     </div>
 </template>

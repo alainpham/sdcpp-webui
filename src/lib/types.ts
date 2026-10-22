@@ -46,6 +46,7 @@ export interface SampleParams {
   scheduler: string;
   sample_method: string;
   sample_steps: number;
+  custom_sigmas: string;
   eta: string | number;
   shifted_timestep: number;
   flow_shift: string | number;
@@ -107,6 +108,11 @@ export interface GenerationForm {
   cache: CacheParams;
 }
 
+export interface WebUiSettings {
+  form: Partial<GenerationForm>;
+  generation_mode: GenerationMode;
+}
+
 // ---------------------------------------------------------------------------
 // LoRA
 // ---------------------------------------------------------------------------
@@ -158,6 +164,7 @@ export interface Capabilities {
 export interface ImageOutput {
   index: number;
   b64_json: string;
+  filename?: string;
 }
 
 export type JobKind = "img_gen" | "vid_gen";
@@ -165,10 +172,20 @@ export type JobKind = "img_gen" | "vid_gen";
 export interface JobResult {
   images?: ImageOutput[];
   output_format?: string;
+  save_error?: string;
   b64_json?: string;
   mime_type?: string;
   fps?: number;
   frame_count?: number;
+}
+
+export interface HistoryImage {
+  filename: string;
+}
+
+export interface SettingsPreset {
+  name: string;
+  settings: WebUiSettings;
 }
 
 export interface Job {
@@ -180,6 +197,7 @@ export interface Job {
   created?: number;
   started?: number;
   completed?: number;
+  completed_images?: string[];
   result?: JobResult | null;
   preview?: {
     pass: number;
