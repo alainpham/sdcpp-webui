@@ -292,6 +292,10 @@ function setMessage(message: string, tone = ""): void {
     statusTone.value = tone;
 }
 
+function randomizeSeed(): void {
+    form.seed = crypto.getRandomValues(new Uint32Array(1))[0];
+}
+
 function clearMessage(): void {
     setMessage("", "");
 }
@@ -700,15 +704,24 @@ onBeforeUnmount(() => {
 
                 <div v-if="generationMode === 'image'" class="fields stack-top">
                     <div class="field"><label>Batch Count</label><input v-model.number="form.batch_count" type="number" min="1" /></div>
-                    <div class="field"><label>Seed</label><input v-model.number="form.seed" type="number" /></div>
+                    <div class="field">
+                        <label for="image-seed">Seed</label>
+                        <div class="seed-input">
+                            <input id="image-seed" v-model.number="form.seed" type="number" />
+                            <button class="btn-secondary" type="button" title="Generate a random seed" @click="randomizeSeed">Random</button>
+                        </div>
+                    </div>
                 </div>
                 <div v-else class="fields stack-top">
                     <div class="field"><label>Video Frames</label><input v-model.number="form.video_frames" type="number" min="1" /></div>
                     <div class="field"><label>FPS</label><input v-model.number="form.fps" type="number" min="1" /></div>
                 </div>
                 <div v-if="generationMode === 'video'" class="field stack-top">
-                    <label>Seed</label>
-                    <input v-model.number="form.seed" type="number" />
+                    <label for="video-seed">Seed</label>
+                    <div class="seed-input">
+                        <input id="video-seed" v-model.number="form.seed" type="number" />
+                        <button class="btn-secondary" type="button" title="Generate a random seed" @click="randomizeSeed">Random</button>
+                    </div>
                 </div>
 
                 <CollapsibleSection class="stack-top" eyebrow="Sample" :summary="sampleSummary" :open="sectionState.sample" variant="module" @toggle="toggleSection('sample')">

@@ -407,6 +407,16 @@ button {
     box-shadow: 0 0 0 3px rgba(17, 24, 39, 0.06);
 }
 
+.seed-input {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+}
+
+.seed-input input {
+    min-width: 0;
+}
+
 .stack-top {
     margin-top: 16px;
 }
