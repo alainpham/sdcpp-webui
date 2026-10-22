@@ -12,6 +12,7 @@ import { availableCacheModes, featuresForMode, supportsEta, supportsFlowShift, u
 import { IMAGE_INPUTS, VIDEO_IMAGE_INPUTS } from "./lib/image-inputs";
 import { assignImageEntries, clearImageEntries, filesToImageEntries, removeImageEntry } from "./lib/images";
 import { createStoredRef, normalizePollIntervalMs } from "./lib/settings";
+import { useTheme } from "./lib/theme";
 import type {
     Capabilities,
     ModelStatus,
@@ -28,6 +29,7 @@ import type {
 const baseUrl = createStoredRef<string>("sdcpp-webui-base-url", "", (value: unknown) => String(value || ""));
 const pollIntervalMs = createStoredRef<number>("sdcpp-webui-poll-interval-ms", 100, normalizePollIntervalMs);
 const activeTab = ref<"image" | "video" | "settings">("image");
+const theme = useTheme();
 const selectedGenerationTab = ref<"image" | "video">("image");
 const generationMode = computed<GenerationMode>(() => selectedGenerationTab.value === "video" ? "video" : "image");
 const lightboxOpen = ref(false);
@@ -645,6 +647,14 @@ onBeforeUnmount(() => {
             </div>
             <div v-if="activeTab === 'settings'" class="settings">
                 <div class="settings__grid">
+                    <div class="field">
+                        <label for="theme">Theme</label>
+                        <select id="theme" v-model="theme">
+                            <option value="system">Device</option>
+                            <option value="light">Light</option>
+                            <option value="dark">Dark</option>
+                        </select>
+                    </div>
                     <div class="field">
                         <label>Base URL</label>
                         <input v-model="baseUrl" placeholder="Leave blank to use same origin" />

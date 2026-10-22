@@ -30,6 +30,7 @@ The current UI supports:
 - VAE tiling controls
 - cache controls
 - job polling, cancellation, image preview, and video or animated WebP preview
+- light and dark themes in Settings, defaulting to Device (follow the system theme); the choice is saved locally and system theme changes apply immediately
 
 ## Requirements
 
