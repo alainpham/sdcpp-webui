@@ -175,6 +175,7 @@ export interface Job {
   id: string;
   kind?: JobKind;
   status: string;
+  cancel_requested?: boolean;
   queue_position?: number;
   created?: number;
   started?: number;

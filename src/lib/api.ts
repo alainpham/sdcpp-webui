@@ -46,7 +46,7 @@ export function submitVideoJob(baseUrl: string, body: unknown): Promise<Job> {
 }
 
 export function getJob(baseUrl: string, id: string): Promise<Job> {
-    return fetchJson<Job>(withBase(baseUrl, `/sdcpp/v1/jobs/${id}`));
+    return fetchJson<Job>(withBase(baseUrl, `/sdcpp/v1/jobs/${id}`), { cache: "no-store" });
 }
 
 export function cancelJob(baseUrl: string, id: string): Promise<Job> {

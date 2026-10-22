@@ -63,6 +63,8 @@ const currentJob = ref<Job | null>(null);
 const selectedOutputIndex = ref(0);
 const statusMessage = ref("");
 const statusTone = ref("");
+const cancelling = ref(false);
+let pollVersion = 0;
 const form = reactive<GenerationForm>(createBlankForm());
 
 let pollTimer = 0;
@@ -192,7 +194,7 @@ const downloadableSrc = computed(() => {
 });
 
 const canCancelCurrentJob = computed(() => {
-    if (!currentJob.value) {
+    if (!currentJob.value || cancelling.value || currentJob.value.cancel_requested) {
         return false;
     }
     if (currentStatus.value === "queued") {
@@ -427,12 +429,19 @@ function startElapsedTimer(): void {
 
 async function pollJob(id: string): Promise<void> {
     stopPolling();
+    const version = ++pollVersion;
     try {
-        currentJob.value = await getJob(baseUrl.value, id);
+        const job = await getJob(baseUrl.value, id);
+        if (version !== pollVersion) return;
+        currentJob.value = job;
         serviceOnline.value = true;
         if (currentStatus.value === "queued" || currentStatus.value === "generating") {
             pollTimer = window.setTimeout(() => pollJob(id), normalizePollIntervalMs(pollIntervalMs.value));
-            clearMessage();
+            if (job.cancel_requested) {
+                setMessage("Cancellation requested. Waiting for generation to stop.", "");
+            } else {
+                clearMessage();
+            }
             return;
         }
         stopElapsedTimer();
@@ -448,9 +457,14 @@ async function pollJob(id: string): Promise<void> {
             setMessage(currentJob.value?.error?.message || "Generation failed.", "error");
         }
     } catch (error) {
-        stopElapsedTimer();
+        if (version !== pollVersion) return;
         serviceOnline.value = false;
         setMessage(error instanceof Error ? error.message : String(error), "error");
+        if (currentJob.value?.id === id && isJobRunning.value) {
+            pollTimer = window.setTimeout(() => pollJob(id), normalizePollIntervalMs(pollIntervalMs.value));
+        } else {
+            stopElapsedTimer();
+        }
     }
 }
 
@@ -472,16 +486,21 @@ async function generate(): Promise<void> {
 }
 
 async function cancelCurrentJob(): Promise<void> {
-    if (!currentJob.value?.id) {
+    if (!currentJob.value?.id || !canCancelCurrentJob.value) {
         return;
     }
+    const id = currentJob.value.id;
+    cancelling.value = true;
+    stopPolling();
+    ++pollVersion;
     try {
-        currentJob.value = await cancelJob(baseUrl.value, currentJob.value.id);
-        stopPolling();
-        stopElapsedTimer();
-        setMessage("Job cancelled.", "error");
+        currentJob.value = await cancelJob(baseUrl.value, id);
+        await pollJob(id);
     } catch (error) {
         setMessage(error instanceof Error ? error.message : String(error), "error");
+        pollTimer = window.setTimeout(() => pollJob(id), normalizePollIntervalMs(pollIntervalMs.value));
+    } finally {
+        cancelling.value = false;
     }
 }
 
@@ -1067,7 +1086,7 @@ onBeforeUnmount(() => {
                     </button>
                     <div class="actions output-controls__secondary">
                         <button class="btn-secondary" type="button" :disabled="!downloadableSrc" @click="downloadSelected">Download</button>
-                        <button class="btn-danger" type="button" :disabled="!canCancelCurrentJob" @click="cancelCurrentJob">Cancel</button>
+                        <button class="btn-danger" type="button" :disabled="!canCancelCurrentJob" @click="cancelCurrentJob">{{ cancelling || (isJobRunning && currentJob?.cancel_requested) ? "Cancelling…" : "Cancel" }}</button>
                     </div>
                 </div>
 
